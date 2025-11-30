@@ -30,6 +30,60 @@ let db;
 let mongoClient;
 let inMemorySensors = [];
 
+function normalizeDate(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function normalizeLimit(rawLimit, fallback = 500) {
+  const parsed = parseInt(rawLimit, 10);
+  if (Number.isNaN(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return Math.min(parsed, 5000); // guard against accidental huge exports
+}
+
+async function getSensorRange({ start, end, limit = 500, sortDirection = -1 }) {
+  const query = {};
+  if (start || end) {
+    query.receivedAt = {};
+    if (start) query.receivedAt.$gte = start;
+    if (end) query.receivedAt.$lte = end;
+  }
+
+  if (useDummyData) {
+    let readings = [...inMemorySensors];
+    if (query.receivedAt) {
+      readings = readings.filter((reading) => {
+        const ts = new Date(reading.receivedAt).getTime();
+        const afterStart = query.receivedAt.$gte ? ts >= query.receivedAt.$gte.getTime() : true;
+        const beforeEnd = query.receivedAt.$lte ? ts <= query.receivedAt.$lte.getTime() : true;
+        return afterStart && beforeEnd;
+      });
+    }
+    readings.sort((a, b) => (sortDirection === 1
+      ? new Date(a.receivedAt) - new Date(b.receivedAt)
+      : new Date(b.receivedAt) - new Date(a.receivedAt)));
+    return readings.slice(0, limit);
+  }
+
+  return db.collection('sensors')
+    .find(query)
+    .sort({ receivedAt: sortDirection })
+    .limit(limit)
+    .toArray();
+}
+
+function escapeCsvValue(value) {
+  if (value === undefined || value === null) return '';
+  const str = value instanceof Date ? value.toISOString() : String(value);
+  if (str.includes('"') || str.includes(',') || str.includes('\n')) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+}
+
 function connectMQTT() {
   const client = mqtt.connect(mqttBroker, {
     clientId: 'mqtt_to_mongodb_' + Math.random().toString(16).substr(2, 8),
@@ -174,6 +228,58 @@ app.post('/api/sensors', async (req, res) => {
   }
 });
 
+// Endpoint to get sensor data within a date range (defaults to latest)
+app.get('/api/sensors/range', async (req, res) => {
+  try {
+    const start = normalizeDate(req.query.start);
+    const end = normalizeDate(req.query.end);
+    const limit = normalizeLimit(req.query.limit, 200);
+
+    if (req.query.start && !start) {
+      return res.status(400).json({ error: 'Invalid start date' });
+    }
+    if (req.query.end && !end) {
+      return res.status(400).json({ error: 'Invalid end date' });
+    }
+
+    const data = await getSensorRange({ start, end, limit, sortDirection: -1 });
+    return res.json({ data, count: data.length });
+  } catch (error) {
+    console.error('Error fetching range data:', error);
+    return res.status(500).json({ error: 'Failed to fetch data' });
+  }
+});
+
+// Endpoint to download sensor data as CSV with optional date range
+app.get('/api/sensors/csv', async (req, res) => {
+  try {
+    const start = normalizeDate(req.query.start);
+    const end = normalizeDate(req.query.end);
+    const limit = normalizeLimit(req.query.limit, 1000);
+
+    if (req.query.start && !start) {
+      return res.status(400).json({ error: 'Invalid start date' });
+    }
+    if (req.query.end && !end) {
+      return res.status(400).json({ error: 'Invalid end date' });
+    }
+
+    const headers = ['ph', 'soil', 'temperature', 'humidity', 'servo_position', 'topic', 'receivedAt'];
+    const data = await getSensorRange({ start, end, limit, sortDirection: 1 });
+    const csvRows = [
+      headers.join(','),
+      ...data.map((row) => headers.map((field) => escapeCsvValue(row[field])).join(',')),
+    ];
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename="sensor-data.csv"');
+    return res.send(csvRows.join('\n'));
+  } catch (error) {
+    console.error('Error generating CSV:', error);
+    return res.status(500).json({ error: 'Failed to generate CSV' });
+  }
+});
+
 // Endpoint to get latest sensor data
 app.get('/api/sensors/latest', async (req, res) => {
   try {
@@ -225,6 +331,52 @@ app.get('/', (req, res) => {
             .status-ok { color: green; }
             .status-warning { color: orange; }
             .status-critical { color: red; }
+            .history-card {
+                border: 1px solid #ddd;
+                padding: 15px;
+                margin-top: 20px;
+                border-radius: 6px;
+                background: #fff;
+                max-width: 740px;
+            }
+            .range-row {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 12px;
+                align-items: flex-end;
+            }
+            .range-row label {
+                font-size: 12px;
+                color: #555;
+            }
+            .range-row input {
+                padding: 6px;
+                border: 1px solid #ccc;
+                border-radius: 4px;
+            }
+            .range-actions button {
+                margin-right: 8px;
+                padding: 8px 12px;
+                border: none;
+                border-radius: 4px;
+                background: #4CAF50;
+                color: white;
+                cursor: pointer;
+            }
+            .range-actions button:hover {
+                opacity: 0.9;
+            }
+            .preview-list {
+                margin-top: 10px;
+            }
+            .preview-item {
+                border-bottom: 1px solid #eee;
+                padding: 6px 0;
+                font-size: 13px;
+            }
+            .preview-item:last-child {
+                border-bottom: none;
+            }
         </style>
     </head>
     <body>
@@ -266,6 +418,27 @@ app.get('/', (req, res) => {
                 <li>High pH (> 5.5) OR Wet soil (> 70%) -> Valve CLOSED (0 deg)</li>
                 <li>Target pH (4.4-5.5) + Good moisture (30-70%) -> Adjust as needed</li>
             </ul>
+        </div>
+
+        <div class="history-card">
+            <h3>Data Range &amp; CSV Export</h3>
+            <div class="range-row">
+                <div>
+                    <label for="start-date">Start</label><br>
+                    <input type="datetime-local" id="start-date">
+                </div>
+                <div>
+                    <label for="end-date">End</label><br>
+                    <input type="datetime-local" id="end-date">
+                </div>
+                <div class="range-actions">
+                    <button id="apply-range" type="button">Apply Range</button>
+                    <button id="reset-range" type="button" style="background:#757575;">Reset</button>
+                    <button id="download-csv" type="button" style="background:#008CBA;">Download CSV</button>
+                </div>
+            </div>
+            <p id="range-status" style="margin-top: 10px;">No range applied yet.</p>
+            <div id="range-preview" class="preview-list"></div>
         </div>
 
         <script>
@@ -324,10 +497,87 @@ app.get('/', (req, res) => {
                     console.error('Error fetching data:', error);
                 }
             }
-            
+
+            // Range helpers for CSV export and quick previews
+            const startInput = document.getElementById('start-date');
+            const endInput = document.getElementById('end-date');
+            const rangeStatus = document.getElementById('range-status');
+            const rangePreview = document.getElementById('range-preview');
+
+            function formatTimestamp(ts) {
+                const date = new Date(ts);
+                return Number.isNaN(date.getTime()) ? '--' : date.toLocaleString();
+            }
+
+            function renderPreview(records) {
+                if (!records.length) {
+                    rangePreview.innerHTML = '<div class="preview-item">No data to preview.</div>';
+                    return;
+                }
+                const html = records.slice(0, 5).map((item) => {
+                    const ph = item.ph ?? '--';
+                    const soil = item.soil ?? '--';
+                    const temp = item.temperature ?? '--';
+                    const humidity = item.humidity ?? '--';
+                    return '<div class="preview-item">' +
+                        '<strong>' + formatTimestamp(item.receivedAt) + '</strong> ' +
+                        '- pH: ' + ph + ' | Soil: ' + soil + '% | Temp: ' + temp + ' C | Humidity: ' + humidity + '%' +
+                        '</div>';
+                }).join('');
+                rangePreview.innerHTML = html;
+            }
+
+            function buildRangeQuery(limit) {
+                const params = new URLSearchParams();
+                if (startInput.value) {
+                    params.set('start', new Date(startInput.value).toISOString());
+                }
+                if (endInput.value) {
+                    params.set('end', new Date(endInput.value).toISOString());
+                }
+                if (limit) {
+                    params.set('limit', String(limit));
+                }
+                return params.toString();
+            }
+
+            async function fetchRangeData() {
+                try {
+                    const query = buildRangeQuery(200);
+                    const response = await fetch('/api/sensors/range' + (query ? ('?' + query) : ''));
+                    const payload = await response.json();
+                    if (!response.ok) {
+                        throw new Error(payload.error || 'Server error');
+                    }
+                    const records = payload.data || [];
+                    const hasRange = Boolean(startInput.value || endInput.value);
+                    rangeStatus.textContent = records.length
+                        ? ('Showing ' + records.length + ' reading(s)' + (hasRange ? ' for selected range' : ' (latest)') + '.')
+                        : 'No data for selected range.';
+                    renderPreview(records);
+                } catch (error) {
+                    console.error('Error fetching range data:', error);
+                    rangeStatus.textContent = 'Failed to load range data.';
+                    renderPreview([]);
+                }
+            }
+
+            document.getElementById('apply-range').addEventListener('click', fetchRangeData);
+            document.getElementById('reset-range').addEventListener('click', () => {
+                startInput.value = '';
+                endInput.value = '';
+                fetchRangeData();
+            });
+            document.getElementById('download-csv').addEventListener('click', () => {
+                const query = buildRangeQuery(1000);
+                const url = '/api/sensors/csv' + (query ? ('?' + query) : '');
+                window.location.href = url;
+            });
+
             // Update every 2 seconds
             setInterval(updateData, 2000);
             updateData(); // Initial load
+            fetchRangeData(); // Load initial preview
         </script>
     </body>
     </html>
